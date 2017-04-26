@@ -97,7 +97,7 @@ func (c *IStore) load(siteId string, channel string, userid string) string {
 	if userid!="" {
 		key = "LaWS_Server:store:"+siteId+":"+userid+":"+channel
 	}
-	fmt.Printf("load: %s \n", key)
+	//fmt.Printf("load: %s \n", key)
 	data, err := redisClient.Get(key).Result()
 	if err==nil {
 		return data
@@ -237,6 +237,10 @@ type jSubscribe struct {
 	Event string `json:"event"`
 	Data string `json:"data"`
 }
+type aMess struct {
+	Event string `json:"event"`
+	Data *json.RawMessage `json:"data"`
+}
 
 type AuthOk struct {
 	Event string `json:"event"`
@@ -255,24 +259,21 @@ type JQuery struct {
 }
 
 func handlerWS(session sockjs.Session) {
-	fmt.Println("new connection to WS server")
+	//fmt.Println("new connection to WS server")
 
 	var WSConn = IWSConn{conn: session, siteId:"", userId:""}
 	WSSrv.connections[session.ID()] = WSConn
-	for k, v := range WSSrv.connections {
-		fmt.Printf("============ %s %s \n", k, v.conn.ID())
-	}
 
 	// Слушаем что нам шлет сокет
 	for {
 		if msg, err := session.Recv(); err == nil {
-			fmt.Printf("new message %s \n", msg)
+			//fmt.Printf("new message %s \n", msg)
 
 			var mapMess interface{}
 			err := json.Unmarshal([]byte(msg), &mapMess)
 			if err!=nil {continue}
 			mapMessStr := mapMess.(map[string]interface{})
-			fmt.Printf("%v\n", mapMess)
+			//fmt.Printf("%v\n", mapMess)
 
 			// =========================
 			// WS Auth
@@ -282,7 +283,7 @@ func handlerWS(session sockjs.Session) {
 				var data map[string] interface{}
 
 				if val, ok := mapMessStr["data"]; ok {
-					fmt.Printf("%v\n", val)
+					//fmt.Printf("%v\n", val)
 					data = val.(map[string] interface{})
 				}else{
 					session.Close(3002, "not found data - param")
@@ -304,8 +305,8 @@ func handlerWS(session sockjs.Session) {
 
 				nSpace, err := redisClient.Get("LaWS_Server:name_spaces:" + siteId).Result()
 				if err != nil {
-					fmt.Printf("ns: %s \n",siteId)
-					fmt.Printf("erro %v \n",err)
+					//fmt.Printf("ns: %s \n",siteId)
+					//fmt.Printf("erro %v \n",err)
 					session.Close(3050, "error strore")
 					continue
 				}
@@ -313,20 +314,21 @@ func handlerWS(session sockjs.Session) {
 					session.Close(3404, "site id not registered")
 					continue
 				}
-				fmt.Printf("parse JWT %s \nsecret: %s \n", authStr, nSpace)
+				//fmt.Printf("parse JWT %s \nsecret: %s \n", authStr, nSpace)
 				// Парсим токен
 				token, err := jwt.Parse(authStr, func(token *jwt.Token) (interface{}, error) {
 					return []byte(nSpace), nil
 				})
+				//fmt.Printf("JWT %v \n", err)
 				if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
-					fmt.Printf("JWT %v \n", token.Claims)
+					//fmt.Printf("JWT %v \n", token.Claims)
 					data := make(map[string] string)
 					data["cid"] = session.ID()
 
 					dataBytes, err := json.Marshal(AuthOk{Event:"auth", Data:data})
 					if err==nil {
 						userId := claims["i"].(string)
-						fmt.Printf("siteId %s userId %s session %s %T\n", siteId, userId, session.ID(), session)
+						//fmt.Printf("siteId %s userId %s session %s %T\n", siteId, userId, session.ID(), session)
 
 						mm, ok := WSSrv.NS_USER[siteId]
 						if  !ok {mm = make(map[string]map[string]sockjs.Session)}
@@ -362,7 +364,7 @@ func handlerWS(session sockjs.Session) {
 				}else{
 					continue
 				}
-				fmt.Println(channelName)
+				//fmt.Println(channelName)
 				WSConn.channels = append(WSConn.channels, channelName)
 
 				mm, ok := WSSrv.NS_CHANNEL_USER[WSConn.siteId]
@@ -384,8 +386,13 @@ func handlerWS(session sockjs.Session) {
 					data := WSSrv.Store.load(WSConn.siteId, channelName, WSConn.userId)
 					if data!="" {WSConn.conn.Send(string(data))}
 				}else if channelName[0:1]!="#" {
+					//fmt.Printf("=========== %s \n", channelName)
 					data := WSSrv.Store.load(WSConn.siteId, channelName, "")
-					if data!="" {WSConn.conn.Send(data)}
+					if data=="" {continue}
+
+					dataB := []byte(data)
+					out, err := json.Marshal(aMess{Event:channelName, Data:(*json.RawMessage)(&dataB)})
+					if err==nil {WSConn.conn.Send(string(out))}
 				}
 			}
 			continue
@@ -421,40 +428,39 @@ func handlerWS(session sockjs.Session) {
 func handleRequest(conn net.Conn) {
 	fmt.Println("new connection")
 	var CSiteId string
-	for{
-		var lengthData int32
-		var err error
-		// Make a buffer to hold incoming data.
-		var readbuf = make([]byte, 1024)
+	var lengthData int32
+	var err error
+	// Make a buffer to hold incoming data.
+	var ok bool
+	var newSiteId string
 
-		// Read the incoming connection into the buffer.
-		reqLen, err := conn.Read(readbuf)
-		if (reqLen>0) {}
+	for{
+		readbuf := make([]byte, 4)
+		_, err = conn.Read(readbuf)
 		if err != nil {
 			fmt.Println("Error reading:", err.Error())
 			conn.Close()
 			return
 		}
-		// Send a response back to person contacting us.
-		fmt.Printf("length: %d \n", reqLen)
-
 		b := bytes.NewBuffer(readbuf)
-		// Считываем длину сообщения
 		binary.Read(b, binary.LittleEndian, &lengthData)
-		if lengthData < 1 {
-			conn.Close();
-			return  ;
-		}
 		fmt.Printf("lengthData: %d \n", lengthData)
-
-		data := readbuf[4 : 4+lengthData]
-		fmt.Println(string(data))
-
-		ok, newSiteId := handlerCommand(data, conn, CSiteId)
-		if !ok {
+		if lengthData < 1 {
 			conn.Close()
-			break
+			return
 		}
+		readbuf = make([]byte, lengthData+1)
+		readed, err := conn.Read(readbuf)
+		if err != nil {
+			//fmt.Println("Error reading:", err.Error())
+			conn.Close()
+			return
+		}
+		fmt.Printf("readed %d \n", readed)
+
+		ok, newSiteId = handlerCommand(readbuf[0 : lengthData], conn, CSiteId)
+
+		if !ok {conn.Close(); break}
 		if newSiteId!="" {CSiteId = newSiteId}
 	}
 }
@@ -480,7 +486,7 @@ func handlerCommand(data []byte, conn net.Conn, CSiteId string) (bool, string) {
 		}
 		val, err := redisClient.Get("LaWS_Server:name_spaces:" + request.Name).Result()
 		if err != nil {
-			fmt.Println("redis Error",err)
+			//fmt.Println("redis Error",err)
 			sendData(InvalidAction{Success:false, Reason:"Error store, try latter...", Code:302}, conn)
 			return true, ""
 		}
@@ -504,7 +510,7 @@ func handlerCommand(data []byte, conn net.Conn, CSiteId string) (bool, string) {
 			sendData(InvalidAction{Success:false, Reason:"Invalid key", Code:306}, conn)
 			return false, ""
 		}
-		fmt.Println("registerNameSpace")
+		//fmt.Println("registerNameSpace")
 
 		has, err := redisClient.Exists("LaWS_Server:name_spaces:" + request.Name).Result()
 		if err != nil {
@@ -527,6 +533,7 @@ func handlerCommand(data []byte, conn net.Conn, CSiteId string) (bool, string) {
 
 	// Check auth
 	if CSiteId=="" {
+		fmt.Println("Need auth")
 		sendData(InvalidAction{Success:false, Reason:"Need auth", Code:311}, conn)
 		return true, ""
 	}
@@ -554,7 +561,8 @@ func handlerCommand(data []byte, conn net.Conn, CSiteId string) (bool, string) {
 		if v, ok := request.Params["userId"]; ok {userId = ItoStr(v)}
 		if v, ok := request.Params["ttl"]; ok {ttl = ItoInt(v)}
 
-		out, _ := json.Marshal(request.Data)
+		out, err := json.Marshal(request.Data)
+		fmt.Printf("error %T", err)
 		WSSrv.set(CSiteId, request.Channel, string(out), userId, emit, ttl)
 		sendData(Success{Success:true}, conn)
 		return true, ""
@@ -618,7 +626,7 @@ func handlerCommand(data []byte, conn net.Conn, CSiteId string) (bool, string) {
 
 func sendDataBytes(dataBytes []byte, conn net.Conn) bool {
 	sz := len(dataBytes)
-	fmt.Printf("len %d \n", sz)
+	//fmt.Printf("len %d \n", sz)
 	buffer := bytes.NewBuffer(make([]byte, 0, 5+sz))
 	binary.Write(buffer, binary.LittleEndian, int32(sz))
 	buffer.Write(dataBytes)
