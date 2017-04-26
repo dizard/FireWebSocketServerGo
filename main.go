@@ -24,6 +24,46 @@ const (
 
 var redisClient *redis.Client
 
+func ItoStr(v interface{}) string {
+	switch vv := v.(type) {
+	case string:
+		return vv
+	case int:
+		return string(vv)
+	case float64:
+		return strconv.FormatFloat(vv, 'f', 0, 64)
+	default:
+		return ""
+	}
+}
+func ItoBool(v interface{}) bool {
+	switch vv := v.(type) {
+	case string:
+		return vv!=""
+	case int:
+		return vv>0
+	case float64:
+		return vv>0
+	default:
+		return false
+	}
+}
+func ItoInt(v interface{}) int {
+	switch vv := v.(type) {
+	case string:
+		i, _ := strconv.ParseInt(vv, 10, 64)
+		return int(i)
+	case int:
+		return vv
+	case float64:
+		return int(vv)
+	default:
+		return 0
+	}
+}
+
+
+
 type InvalidAction struct {
 	Success bool `json:"success"`
 	Reason string `json:"reason"`
@@ -42,12 +82,100 @@ type IWSConn struct {
 	siteId string
 	userId string
 }
+type IStore struct{}
+func (c *IStore) save(siteId string, channel string, message string, userid string, ttl int) bool {
+	key := "LaWS_Server:store:"+siteId+":"+channel
+	if userid!="" {
+		key = "LaWS_Server:store:"+siteId+":"+userid+":"+channel
+	}
+	fmt.Printf("save: %s - %s\n", key, message)
+	redisClient.Set(key, message, 0).Err()
+	return true
+}
+func (c *IStore) load(siteId string, channel string, userid string) string {
+	key := "LaWS_Server:store:"+siteId+":"+channel
+	if userid!="" {
+		key = "LaWS_Server:store:"+siteId+":"+userid+":"+channel
+	}
+	fmt.Printf("load: %s \n", key)
+	data, err := redisClient.Get(key).Result()
+	if err==nil {
+		return data
+	}
+	return ""
+}
+
 type WS_Server struct {
 	connections map[string]IWSConn
+	// siteId userId sessionid = session
 	NS_USER map[string]map[string]map[string]sockjs.Session
+	// siteId  channel  userId
 	PRIVATE map[string]map[string]map[string]int
+	// siteId channelName userId  sessionid = session
 	NS_CHANNEL_USER map[string]map[string]map[string]map[string]sockjs.Session
+	Store IStore
 }
+func (c *WS_Server) emit(siteId string, channel string, message string, userid string) bool {
+	if _, ok := WSSrv.NS_CHANNEL_USER[siteId]; !ok { return true }
+	if _, ok := WSSrv.NS_CHANNEL_USER[siteId][channel]; !ok { return true }
+	if channel[0:1]=="@" {
+		// Пользовательский канал
+		if _, ok := WSSrv.NS_CHANNEL_USER[siteId][channel][userid]; !ok { return true }
+		for kS := range WSSrv.NS_USER[siteId][userid] {
+			WSSrv.NS_USER[siteId][userid][kS].Send(message)
+		}
+		return true
+	}
+	for kU := range WSSrv.NS_CHANNEL_USER[siteId][channel] {
+		for kS := range WSSrv.NS_USER[siteId][kU] {
+			WSSrv.NS_USER[siteId][kU][kS].Send(message)
+		}
+	}
+	return true
+}
+func (c *WS_Server) get(siteId string, channel string, userid string) []byte {
+	return []byte(c.Store.load(siteId, channel, userid))
+}
+func (c *WS_Server) set(siteId string, channel string, message string, userid string, emit bool, ttl int) bool {
+	c.Store.save(siteId, channel, message, userid, ttl)
+	if emit {c.emit(siteId, channel, message, userid)}
+	return true
+}
+func (c *WS_Server) subscribe(siteId string, channel string, userid string) bool {
+	mm, ok := c.PRIVATE[siteId]
+	if  !ok {mm = make(map[string]map[string]int)}
+	c.PRIVATE[siteId] = mm
+	mmm, ok := c.PRIVATE[siteId][channel]
+	if  !ok{mmm = make(map[string]int)}
+	c.PRIVATE[siteId][channel] = mmm
+	c.PRIVATE[siteId][channel][userid] = 1
+	return true
+}
+func (c *WS_Server) unSubscribe(siteId string, channel string, userid string) bool {
+	_, ok := c.PRIVATE[siteId]
+	if  !ok {return true}
+	_, ok = c.PRIVATE[siteId][channel]
+	if  !ok {return true}
+	_, ok = c.PRIVATE[siteId][channel][userid]
+	if  !ok {return true}
+
+	// Чистим лишнее
+	delete(c.PRIVATE[siteId][channel], userid)
+	if len(c.PRIVATE[siteId][channel])==0 {
+		delete(c.PRIVATE[siteId], channel)
+	}
+	if len(c.PRIVATE[siteId])==0 {
+		delete(c.PRIVATE, siteId)
+	}
+	return true
+}
+func (c *WS_Server) channelInfo(siteId string, channel string) []byte {
+	return []byte("")
+}
+
+
+
+
 var WSSrv *WS_Server
 
 func runWS_Server()  {
@@ -57,6 +185,7 @@ func runWS_Server()  {
 		NS_USER: make(map[string]map[string]map[string]sockjs.Session),
 		PRIVATE: make(map[string]map[string]map[string]int),
 		NS_CHANNEL_USER: make(map[string]map[string]map[string]map[string]sockjs.Session),
+		Store: IStore{},
 	}
 	handler := sockjs.NewHandler("/socket", sockjs.DefaultOptions, handlerWS)
 	log.Fatal(http.ListenAndServe(":8080", handler))
@@ -91,6 +220,7 @@ func main() {
 		Password: "dizardKom@cherS", // no password set
 		DB:       0,  // use default DB
 	})
+
 	go runWS_Server()
 	runNET_Server()
 }
@@ -132,7 +262,6 @@ func handlerWS(session sockjs.Session) {
 	for k, v := range WSSrv.connections {
 		fmt.Printf("============ %s %s \n", k, v.conn.ID())
 	}
-
 
 	// Слушаем что нам шлет сокет
 	for {
@@ -249,6 +378,15 @@ func handlerWS(session sockjs.Session) {
 				WSSrv.NS_CHANNEL_USER[WSConn.siteId][channelName][WSConn.userId] = mmmm
 
 				WSSrv.NS_CHANNEL_USER[WSConn.siteId][channelName][WSConn.userId][session.ID()] = session
+
+
+				if channelName[0:1]=="@" {
+					data := WSSrv.Store.load(WSConn.siteId, channelName, WSConn.userId)
+					if data!="" {WSConn.conn.Send(string(data))}
+				}else if channelName[0:1]!="#" {
+					data := WSSrv.Store.load(WSConn.siteId, channelName, "")
+					if data!="" {WSConn.conn.Send(data)}
+				}
 			}
 			continue
 		}
@@ -282,6 +420,7 @@ func handlerWS(session sockjs.Session) {
 // Handles incoming requests.
 func handleRequest(conn net.Conn) {
 	fmt.Println("new connection")
+	var CSiteId string
 	for{
 		var lengthData int32
 		var err error
@@ -311,239 +450,173 @@ func handleRequest(conn net.Conn) {
 		data := readbuf[4 : 4+lengthData]
 		fmt.Println(string(data))
 
-		if (!handlerCommand(data, conn)) {
+		ok, newSiteId := handlerCommand(data, conn, CSiteId)
+		if !ok {
 			conn.Close()
 			break
 		}
+		if newSiteId!="" {CSiteId = newSiteId}
 	}
 }
 // Обрабочик команд TCP сервера
-func handlerCommand(data []byte, conn net.Conn) bool {
+func handlerCommand(data []byte, conn net.Conn, CSiteId string) (bool, string) {
 	var request JQuery
 	err := json.Unmarshal(data, &request)
 	if  err!=nil  {
 		fmt.Println("Error", err)
-		return false
+		return false, ""
 	}
 
 	// TODO check auth
 	fmt.Printf("===== %v\n", request)
 	if request.Action=="auth" {
-		if request.SKey =="" {return false}
-		if request.Name=="" {return false}
+		if request.SKey =="" {return false, ""}
+		if request.Name=="" {return false, ""}
 		fmt.Println("auth \n")
 		has, err := redisClient.Exists("LaWS_Server:name_spaces:" + request.Name).Result()
 		if has==0 || err !=nil {
 			sendData(InvalidAction{Success:false, Reason:"Name space not found", Code:404}, conn)
-			return true
+			return true, ""
 		}
 		val, err := redisClient.Get("LaWS_Server:name_spaces:" + request.Name).Result()
 		if err != nil {
 			fmt.Println("redis Error",err)
 			sendData(InvalidAction{Success:false, Reason:"Error store, try latter...", Code:302}, conn)
-			return true
+			return true, ""
 		}
 		if val==request.SKey {
 			sendData(Success{Success:true}, conn)
-			return true
+			return true, request.Name
 		}
 		sendData(InvalidAction{Success:false, Reason:"Invalid sKey", Code:305}, conn)
-		return true
+		return true, ""
 	}
 	if request.Action=="registerNameSpace" {
 		if request.Name=="" {
 			sendData(InvalidAction{Success:false, Reason:"Need name", Code:300}, conn)
-			return false
+			return false, ""
 		}
 		if request.Key=="" {
 			sendData(InvalidAction{Success:false, Reason:"Need key", Code:300}, conn)
-			return false
+			return false, ""
 		}
 		if request.Key!="asd82nvakadfs" {
 			sendData(InvalidAction{Success:false, Reason:"Invalid key", Code:306}, conn)
-			return false
+			return false, ""
 		}
 		fmt.Println("registerNameSpace")
 
 		has, err := redisClient.Exists("LaWS_Server:name_spaces:" + request.Name).Result()
 		if err != nil {
 			sendData(InvalidAction{Success:false, Reason:"Error store, try latter...", Code:302}, conn)
-			return false
+			return false, ""
 		}
 		if has==1 {
 			sendData(InvalidAction{Success:false, Reason:"Name space is busy", Code:309}, conn)
-			return false
+			return false, ""
 		}
 		secretKey := uuid.NewV4().String()
 		err = redisClient.Set("LaWS_Server:name_spaces:"+request.Name, secretKey, 0).Err()
 		if err != nil {
 			sendData(InvalidAction{Success:false, Reason:"Error store, try latter...", Code:302}, conn)
-			return false
+			return false, ""
 		}
 		sendData(RegNS_OK{Success:true, SecretKey:secretKey}, conn)
-		return true
+		return true, ""
+	}
+
+	// Check auth
+	if CSiteId=="" {
+		sendData(InvalidAction{Success:false, Reason:"Need auth", Code:311}, conn)
+		return true, ""
 	}
 	if request.Action=="emit" {
 		if request.Channel=="" {
 			sendData(InvalidAction{Success:false, Reason:"Need channel", Code:300}, conn)
-			return true
+			return true, ""
 		}
-		fmt.Printf("userid: %T\n", request.Params["userId"])
+		var userId string
+		if v, ok := request.Params["userId"]; ok {userId = ItoStr(v)}
+
+		out, _ := json.Marshal(request.Data)
+		WSSrv.emit(CSiteId, request.Channel, string(out), userId)
+		sendData(Success{Success:true}, conn)
+		return true, ""
+	}
+	if request.Action=="set" {
+		if request.Channel=="" {
+			sendData(InvalidAction{Success:false, Reason:"Need channel", Code:300}, conn)
+			return true, ""
+		}
+		var userId string
+		var emit bool
+		var ttl int
+		if v, ok := request.Params["userId"]; ok {userId = ItoStr(v)}
+		if v, ok := request.Params["ttl"]; ok {ttl = ItoInt(v)}
+
+		out, _ := json.Marshal(request.Data)
+		WSSrv.set(CSiteId, request.Channel, string(out), userId, emit, ttl)
+		sendData(Success{Success:true}, conn)
+		return true, ""
+	}
+	if request.Action=="get" {
+		if request.Channel=="" {
+			sendData(InvalidAction{Success:false, Reason:"Need channel", Code:300}, conn)
+			return true, ""
+		}
+		var userId string
+		if v, ok := request.Params["userId"]; ok {userId = ItoStr(v)}
+		sendDataBytes(WSSrv.get(CSiteId, request.Channel, userId), conn)
+		return true, ""
+	}
+	if request.Action=="subscribe" {
+		if request.Channel=="" {
+			sendData(InvalidAction{Success:false, Reason:"Need channel", Code:300}, conn)
+			return true, ""
+		}
 		var userId string
 		if v, ok := request.Params["userId"]; ok {
-			switch vv := v.(type) {
-			case string:
-				fmt.Println("is string", vv)
-			case int:
-				fmt.Println("is int", vv)
-			case float64:
-				userId = strconv.FormatFloat(vv, 'f', 0, 64)
-			case []interface{}:
-				fmt.Println("is an array:")
-			default:
-				fmt.Println("is of a type I don't know how to handle")
-			}
-
-//			userId = string(val)
-		}
-		fmt.Printf("userid: %s\n", userId)
-		out, _ := json.Marshal(request.Data)
-		fmt.Printf("data: %s \n", string(out))
-	}
-	sendData(InvalidAction{Success:false, Reason:"Invalid action...", Code:312}, conn)
-	return true
-}
-
-func handlerCommandOld(data []byte, conn net.Conn) bool {
-	var anything interface{}
-	err := json.Unmarshal(data, &anything)
-	if ( err!=nil ) {
-		return false
-	}
-	fmt.Printf("%v\n", anything)
-
-	dataMapStr := anything.(map[string]interface{})
-	if (dataMapStr["action"]=="auth") {
-		fmt.Println("auth \n")
-		var siteId string
-		var secretKey string
-
-		if val, ok := dataMapStr["sKey"].(string); ok {
-			secretKey = val
+			userId = ItoStr(v)
 		}else{
-			return false
-		}
-		if val, ok := dataMapStr["name"].(string); ok {
-			siteId = val
-		}else{
-			return false
+			sendData(InvalidAction{Success:false, Reason:"Need userid", Code:300}, conn)
+			return true, ""
 		}
 
-		has, err := redisClient.Exists("LaWS_Server:name_spaces:" + siteId).Result()
-		if (has==0) {
-			sendData(InvalidAction{Success:false, Reason:"Name space not found", Code:404}, conn)
-			return true
-		}
-		val, err := redisClient.Get("LaWS_Server:name_spaces:" + siteId).Result()
-		if err != nil {
-			fmt.Println("redis Error",err)
-			sendData(InvalidAction{Success:false, Reason:"Error store, try latter...", Code:302}, conn)
-			return true
-		}
-		if (val==secretKey) {
-			sendData(Success{Success:true}, conn)
-			return true
-		}else{
-			sendData(InvalidAction{Success:false, Reason:"Invalid sKey", Code:305}, conn)
-			return true
-		}
-	}
-	if (dataMapStr["action"]=="registerNameSpace") {
-		fmt.Println("registerNameSpace")
-		var name string
-		var key string
-		if val, ok := dataMapStr["name"].(string); ok {
-			name = val
-		}else{
-			sendData(InvalidAction{Success:false, Reason:"Need name", Code:300}, conn)
-			return false
-		}
-		if val, ok := dataMapStr["key"].(string); ok {
-			key = val
-		}else{
-			sendData(InvalidAction{Success:false, Reason:"Need key", Code:300}, conn)
-			return false
-		}
-		if (key!="asd82nvakadfs") {
-			sendData(InvalidAction{Success:false, Reason:"Invalid key", Code:306}, conn)
-			return false;
-		}
-		has, err := redisClient.Exists("LaWS_Server:name_spaces:" + name).Result()
-		if (err != nil) {
-			sendData(InvalidAction{Success:false, Reason:"Error store, try latter...", Code:302}, conn)
-			return false
-		}
-		if (has==1) {
-			sendData(InvalidAction{Success:false, Reason:"Name space is busy", Code:309}, conn)
-			return false
-		}
-		secretKey := uuid.NewV4().String()
-		err = redisClient.Set("LaWS_Server:name_spaces:"+name, secretKey, 0).Err()
-		if err != nil {
-			sendData(InvalidAction{Success:false, Reason:"Error store, try latter...", Code:302}, conn)
-			return false
-		}
-		sendData(RegNS_OK{Success:true, SecretKey:secretKey}, conn)
-		return true
-	}
-	if (dataMapStr["action"]=="emit") {
-		var channel string
-		var data string
-		fmt.Println("=== emit === \n")
-		if val, ok := dataMapStr["channel"].(string); ok {
-			channel = val
-		}else{
-			return false
-		}
-		fmt.Printf("%T \n", dataMapStr["data"])
-		if val, ok := dataMapStr["data"].(string); ok {
-			data = val
-		}else{
-			sendData(Success{Success:false}, conn)
-			return false
-		}
-		fmt.Printf("channel: %s %s \n", channel, data)
-
-		fmt.Println(dataMapStr["data"].(string))
-
+		WSSrv.subscribe(CSiteId, request.Channel, userId)
 		sendData(Success{Success:true}, conn)
-		return true
+		return true, ""
 	}
-	if (dataMapStr["action"]=="set") {
+	if request.Action=="unsubscribe" {
+		if request.Channel=="" {
+			sendData(InvalidAction{Success:false, Reason:"Need channel", Code:300}, conn)
+			return true, ""
+		}
+		var userId string
+		if v, ok := request.Params["userId"]; ok {
+			userId = ItoStr(v)
+		}else{
+			sendData(InvalidAction{Success:false, Reason:"Need userid", Code:300}, conn)
+			return true, ""
+		}
 
+		WSSrv.unSubscribe(CSiteId, request.Channel, userId)
+		sendData(Success{Success:true}, conn)
+		return true, ""
 	}
-	if (dataMapStr["action"]=="get") {
-
-	}
-	if (dataMapStr["action"]=="channelInfo") {
-
-	}
-	if (dataMapStr["action"]=="subscribe") {
-
-	}
-	if (dataMapStr["action"]=="unsubscribe") {
-
+	if request.Action=="channelInfo" {
+		if request.Channel=="" {
+			sendData(InvalidAction{Success:false, Reason:"Need channel", Code:300}, conn)
+			return true, ""
+		}
+		sendDataBytes(WSSrv.channelInfo(CSiteId, request.Channel), conn)
+		return true, ""
 	}
 
 	sendData(InvalidAction{Success:false, Reason:"Invalid action...", Code:312}, conn)
-	return true
+	return true, ""
 }
 
-func sendData(data interface{}, conn net.Conn) bool {
-	dataBytes, err := json.Marshal(data)
-	if ( err!=nil ) {
-		return false
-	}
+func sendDataBytes(dataBytes []byte, conn net.Conn) bool {
 	sz := len(dataBytes)
 	fmt.Printf("len %d \n", sz)
 	buffer := bytes.NewBuffer(make([]byte, 0, 5+sz))
@@ -552,6 +625,11 @@ func sendData(data interface{}, conn net.Conn) bool {
 	binary.Write(buffer, binary.LittleEndian, byte(0))
 	//binary.Write(buffer, binary.LittleEndian, byte(0))
 	conn.Write(buffer.Bytes())
-	fmt.Printf("answer %s \n", buffer.String())
+	//fmt.Printf("answer %s \n", buffer.String())
 	return true
+}
+func sendData(data interface{}, conn net.Conn) bool {
+	dataBytes, err := json.Marshal(data)
+	if  err!=nil  {return false}
+	return sendDataBytes(dataBytes, conn)
 }
