@@ -35,11 +35,14 @@ type RegNS_OK struct {
 type Success struct {
 	Success bool `json:"success"`
 }
-type WSConn struct {
+type IWSConn struct {
 	conn sockjs.Session
+	channels []string
+	siteId string
+	userId string
 }
 type WS_Server struct {
-	connections map[string] sockjs.Session
+	connections map[string]IWSConn
 	NS_USER map[string]map[string]map[string]sockjs.Session
 	PRIVATE map[string]map[string]map[string]int
 	NS_CHANNEL_USER map[string]map[string]map[string]map[string]sockjs.Session
@@ -49,8 +52,10 @@ var WSSrv *WS_Server
 func runWS_Server()  {
 	fmt.Println("Run WS server")
 	WSSrv = &WS_Server{
-		connections: make(map[string]sockjs.Session),
+		connections: make(map[string]IWSConn),
 		NS_USER: make(map[string]map[string]map[string]sockjs.Session),
+		PRIVATE: make(map[string]map[string]map[string]int),
+		NS_CHANNEL_USER: make(map[string]map[string]map[string]map[string]sockjs.Session),
 	}
 	handler := sockjs.NewHandler("/socket", sockjs.DefaultOptions, handlerWS)
 	log.Fatal(http.ListenAndServe(":8080", handler))
@@ -109,10 +114,10 @@ type AuthOk struct {
 func handlerWS(session sockjs.Session) {
 	fmt.Println("new connection to WS server")
 
-	//fmt.Printf("%s %T", session.ID(), session)
-	WSSrv.connections[session.ID()] = session
+	var WSConn = IWSConn{conn: session, siteId:"", userId:""}
+	WSSrv.connections[session.ID()] = WSConn
 	for k, v := range WSSrv.connections {
-		fmt.Printf("============ %s %s \n", k, v.ID())
+		fmt.Printf("============ %s %s \n", k, v.conn.ID())
 	}
 
 
@@ -188,6 +193,9 @@ func handlerWS(session sockjs.Session) {
 						if  !ok{mmm = make(map[string]sockjs.Session)}
 						WSSrv.NS_USER[siteId][userId] = mmm
 						WSSrv.NS_USER[siteId][userId][session.ID()] = session
+
+						WSConn.siteId = siteId
+						WSConn.userId = userId
 						session.Send(string(dataBytes))
 					}else{
 						session.Close(3404, "Invalid token")
@@ -201,6 +209,11 @@ func handlerWS(session sockjs.Session) {
 			// =========================
 			// WS subscribe
 			if mapMessStr["event"]=="subscribe" {
+				if (WSConn.siteId=="" || WSConn.userId=="") {
+					WSConn.conn.Send("need auth")
+					continue
+				}
+
 				var channelName string
 				if val, ok := mapMessStr["data"]; ok {
 					channelName = val.(string)
@@ -208,19 +221,50 @@ func handlerWS(session sockjs.Session) {
 					continue
 				}
 				fmt.Println(channelName)
+				WSConn.channels = append(WSConn.channels, channelName)
+
+				mm, ok := WSSrv.NS_CHANNEL_USER[WSConn.siteId]
+				if  !ok {mm = make(map[string]map[string]map[string]sockjs.Session)}
+				WSSrv.NS_CHANNEL_USER[WSConn.siteId] = mm
+
+				mmm, ok := WSSrv.NS_CHANNEL_USER[WSConn.siteId][channelName]
+				if  !ok{mmm = make(map[string]map[string]sockjs.Session)}
+				WSSrv.NS_CHANNEL_USER[WSConn.siteId][channelName] = mmm
+
+				mmmm, ok := WSSrv.NS_CHANNEL_USER[WSConn.siteId][channelName][WSConn.userId]
+				if  !ok{mmmm = make(map[string]sockjs.Session)}
+				WSSrv.NS_CHANNEL_USER[WSConn.siteId][channelName][WSConn.userId] = mmmm
+
+				WSSrv.NS_CHANNEL_USER[WSConn.siteId][channelName][WSConn.userId][session.ID()] = session
 			}
 			continue
 		}
-
-		delete(WSSrv.connections, session.ID())
-		fmt.Println("=========== connection closed =================")
 		break
 	}
+
+	// ===============================================
+	// =========== connection closed =================
+	for _, channelName := range WSConn.channels {
+		//fmt.Printf("channel %s \n", channelName)
+		delete(WSSrv.NS_CHANNEL_USER[WSConn.siteId][channelName][WSConn.userId], WSConn.siteId)
+
+		// Очищаем пустой map
+		if len(WSSrv.NS_CHANNEL_USER[WSConn.siteId][channelName][WSConn.userId]) == 0 {
+			delete(WSSrv.NS_CHANNEL_USER[WSConn.siteId][channelName], WSConn.userId)
+		}
+		if len(WSSrv.NS_CHANNEL_USER[WSConn.siteId][channelName]) == 0 {
+			delete(WSSrv.NS_CHANNEL_USER[WSConn.siteId], channelName)
+		}
+		if len(WSSrv.NS_CHANNEL_USER[WSConn.siteId]) == 0 {
+			delete(WSSrv.NS_CHANNEL_USER, WSConn.siteId)
+		}
+	}
+	delete(WSSrv.connections, WSConn.conn.ID())
 }
 
-func convertByteToInt(in []byte) int32 {
-	return  (int32(in[0]) << 24 | int32(in[1]) << 16 | int32(in[2]) << 8 | int32(in[3]))
-}
+//func convertByteToInt(in []byte) int32 {
+//	return  (int32(in[0]) << 24 | int32(in[1]) << 16 | int32(in[2]) << 8 | int32(in[3]))
+//}
 
 // Handles incoming requests.
 func handleRequest(conn net.Conn) {
