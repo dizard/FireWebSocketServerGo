@@ -12,6 +12,7 @@ import (
 	"gopkg.in/igm/sockjs-go.v2/sockjs"
 	"log"
 	"net/http"
+	"github.com/dgrijalva/jwt-go"
 )
 
 const (
@@ -34,9 +35,23 @@ type RegNS_OK struct {
 type Success struct {
 	Success bool `json:"success"`
 }
+type WSConn struct {
+	conn sockjs.Session
+}
+type WS_Server struct {
+	connections map[string] sockjs.Session
+	NS_USER map[string]map[string]map[string]sockjs.Session
+	PRIVATE map[string]map[string]map[string]int
+	NS_CHANNEL_USER map[string]map[string]map[string]map[string]sockjs.Session
+}
+var WSSrv *WS_Server
 
 func runWS_Server()  {
 	fmt.Println("Run WS server")
+	WSSrv = &WS_Server{
+		connections: make(map[string]sockjs.Session),
+		NS_USER: make(map[string]map[string]map[string]sockjs.Session),
+	}
 	handler := sockjs.NewHandler("/socket", sockjs.DefaultOptions, handlerWS)
 	log.Fatal(http.ListenAndServe(":8080", handler))
 }
@@ -74,32 +89,134 @@ func main() {
 	runNET_Server()
 }
 
-type WS_Server struct {
-	connections map[string]sockjs.Session
-}
-func NewWS_Server() *WS_Server {
-	return &WS_Server{
-		connections: make(map[string] sockjs.Session),
-	}
-}
+
 
 var connections map[string]sockjs.Session
 
+type jAuth struct {
+	Event string `json:"event"`
+	Data map[string]string `json:"data"`
+}
+type jSubscribe struct {
+	Event string `json:"event"`
+	Data string `json:"data"`
+}
+
+type AuthOk struct {
+	Event string `json:"event"`
+	Data map[string]string `json:"data"`
+}
 func handlerWS(session sockjs.Session) {
 	fmt.Println("new connection to WS server")
-	fmt.Printf("%s %T", session.ID(), session)
-	WSMap := NewWS_Server()
-	WSMap.connections[session.ID()] = session
 
+	//fmt.Printf("%s %T", session.ID(), session)
+	WSSrv.connections[session.ID()] = session
+	for k, v := range WSSrv.connections {
+		fmt.Printf("============ %s %s \n", k, v.ID())
+	}
+
+
+	// Слушаем что нам шлет сокет
 	for {
 		if msg, err := session.Recv(); err == nil {
-			session.Send(msg)
+			fmt.Printf("new message %s \n", msg)
+
+			var mapMess interface{}
+			err := json.Unmarshal([]byte(msg), &mapMess)
+			if err!=nil {continue}
+			mapMessStr := mapMess.(map[string]interface{})
+			fmt.Printf("%v\n", mapMess)
+
+			// =========================
+			// WS Auth
+			if mapMessStr["event"]=="auth" {
+				var siteId string
+				var authStr string
+				var data map[string] interface{}
+
+				if val, ok := mapMessStr["data"]; ok {
+					fmt.Printf("%v\n", val)
+					data = val.(map[string] interface{})
+				}else{
+					session.Close(3002, "not found data - param")
+					continue
+				}
+
+				if val, ok :=data["i"]; ok {
+					siteId = val.(string)
+				}else{
+					session.Close(3002, "not found i - param, site id")
+					continue
+				}
+				if val, ok := data["s"]; ok {
+					authStr = val.(string)
+				}else{
+					session.Close(3002, "not found s - param, auth string")
+					continue
+				}
+
+				nSpace, err := redisClient.Get("LaWS_Server:name_spaces:" + siteId).Result()
+				if err != nil {
+					fmt.Printf("ns: %s \n",siteId)
+					fmt.Printf("erro %v \n",err)
+					session.Close(3050, "error strore")
+					continue
+				}
+				if (nSpace=="") {
+					session.Close(3404, "site id not registered")
+					continue
+				}
+				fmt.Printf("parse JWT %s \nsecret: %s \n", authStr, nSpace)
+				// Парсим токен
+				token, err := jwt.Parse(authStr, func(token *jwt.Token) (interface{}, error) {
+					return []byte(nSpace), nil
+				})
+				if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
+					fmt.Printf("JWT %v \n", token.Claims)
+					data := make(map[string] string)
+					data["cid"] = session.ID()
+
+					dataBytes, err := json.Marshal(AuthOk{Event:"auth", Data:data})
+					if err==nil {
+						userId := claims["i"].(string)
+						fmt.Printf("siteId %s userId %s session %s %T\n", siteId, userId, session.ID(), session)
+
+						mm, ok := WSSrv.NS_USER[siteId]
+						if  !ok {mm = make(map[string]map[string]sockjs.Session)}
+						WSSrv.NS_USER[siteId] = mm
+						mmm, ok := WSSrv.NS_USER[siteId][userId]
+						if  !ok{mmm = make(map[string]sockjs.Session)}
+						WSSrv.NS_USER[siteId][userId] = mmm
+						WSSrv.NS_USER[siteId][userId][session.ID()] = session
+						session.Send(string(dataBytes))
+					}else{
+						session.Close(3404, "Invalid token")
+						continue
+					}
+				} else {
+					session.Close(3404, "Invalid token")
+					continue
+				}
+			}
+			// =========================
+			// WS subscribe
+			if mapMessStr["event"]=="subscribe" {
+				var channelName string
+				if val, ok := mapMessStr["data"]; ok {
+					channelName = val.(string)
+				}else{
+					continue
+				}
+				fmt.Println(channelName)
+			}
 			continue
 		}
+
+		delete(WSSrv.connections, session.ID())
+		fmt.Println("=========== connection closed =================")
 		break
 	}
 }
-
 
 func convertByteToInt(in []byte) int32 {
 	return  (int32(in[0]) << 24 | int32(in[1]) << 16 | int32(in[2]) << 8 | int32(in[3]))
