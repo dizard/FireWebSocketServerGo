@@ -13,6 +13,7 @@ import (
 	"log"
 	"net/http"
 	"github.com/dgrijalva/jwt-go"
+	"strconv"
 )
 
 const (
@@ -111,6 +112,18 @@ type AuthOk struct {
 	Event string `json:"event"`
 	Data map[string]string `json:"data"`
 }
+
+type JQuery struct {
+	Action  string `json:"action"`
+	Name    string `json:"name"`
+	Channel string `json:"channel"`
+	SKey    string `json:"sKey"`
+	Key     string `json:"key"`
+	Data    map[string]interface{} `json:"data"`
+	Params  map[string]interface{} `json:"params"`
+
+}
+
 func handlerWS(session sockjs.Session) {
 	fmt.Println("new connection to WS server")
 
@@ -306,12 +319,108 @@ func handleRequest(conn net.Conn) {
 }
 // Обрабочик команд TCP сервера
 func handlerCommand(data []byte, conn net.Conn) bool {
+	var request JQuery
+	err := json.Unmarshal(data, &request)
+	if  err!=nil  {
+		fmt.Println("Error", err)
+		return false
+	}
+
+	// TODO check auth
+	fmt.Printf("===== %v\n", request)
+	if request.Action=="auth" {
+		if request.SKey =="" {return false}
+		if request.Name=="" {return false}
+		fmt.Println("auth \n")
+		has, err := redisClient.Exists("LaWS_Server:name_spaces:" + request.Name).Result()
+		if has==0 || err !=nil {
+			sendData(InvalidAction{Success:false, Reason:"Name space not found", Code:404}, conn)
+			return true
+		}
+		val, err := redisClient.Get("LaWS_Server:name_spaces:" + request.Name).Result()
+		if err != nil {
+			fmt.Println("redis Error",err)
+			sendData(InvalidAction{Success:false, Reason:"Error store, try latter...", Code:302}, conn)
+			return true
+		}
+		if val==request.SKey {
+			sendData(Success{Success:true}, conn)
+			return true
+		}
+		sendData(InvalidAction{Success:false, Reason:"Invalid sKey", Code:305}, conn)
+		return true
+	}
+	if request.Action=="registerNameSpace" {
+		if request.Name=="" {
+			sendData(InvalidAction{Success:false, Reason:"Need name", Code:300}, conn)
+			return false
+		}
+		if request.Key=="" {
+			sendData(InvalidAction{Success:false, Reason:"Need key", Code:300}, conn)
+			return false
+		}
+		if request.Key!="asd82nvakadfs" {
+			sendData(InvalidAction{Success:false, Reason:"Invalid key", Code:306}, conn)
+			return false
+		}
+		fmt.Println("registerNameSpace")
+
+		has, err := redisClient.Exists("LaWS_Server:name_spaces:" + request.Name).Result()
+		if err != nil {
+			sendData(InvalidAction{Success:false, Reason:"Error store, try latter...", Code:302}, conn)
+			return false
+		}
+		if has==1 {
+			sendData(InvalidAction{Success:false, Reason:"Name space is busy", Code:309}, conn)
+			return false
+		}
+		secretKey := uuid.NewV4().String()
+		err = redisClient.Set("LaWS_Server:name_spaces:"+request.Name, secretKey, 0).Err()
+		if err != nil {
+			sendData(InvalidAction{Success:false, Reason:"Error store, try latter...", Code:302}, conn)
+			return false
+		}
+		sendData(RegNS_OK{Success:true, SecretKey:secretKey}, conn)
+		return true
+	}
+	if request.Action=="emit" {
+		if request.Channel=="" {
+			sendData(InvalidAction{Success:false, Reason:"Need channel", Code:300}, conn)
+			return true
+		}
+		fmt.Printf("userid: %T\n", request.Params["userId"])
+		var userId string
+		if v, ok := request.Params["userId"]; ok {
+			switch vv := v.(type) {
+			case string:
+				fmt.Println("is string", vv)
+			case int:
+				fmt.Println("is int", vv)
+			case float64:
+				userId = strconv.FormatFloat(vv, 'f', 0, 64)
+			case []interface{}:
+				fmt.Println("is an array:")
+			default:
+				fmt.Println("is of a type I don't know how to handle")
+			}
+
+//			userId = string(val)
+		}
+		fmt.Printf("userid: %s\n", userId)
+		out, _ := json.Marshal(request.Data)
+		fmt.Printf("data: %s \n", string(out))
+	}
+	sendData(InvalidAction{Success:false, Reason:"Invalid action...", Code:312}, conn)
+	return true
+}
+
+func handlerCommandOld(data []byte, conn net.Conn) bool {
 	var anything interface{}
 	err := json.Unmarshal(data, &anything)
 	if ( err!=nil ) {
 		return false
 	}
-	fmt.Printf("%v", anything)
+	fmt.Printf("%v\n", anything)
 
 	dataMapStr := anything.(map[string]interface{})
 	if (dataMapStr["action"]=="auth") {
@@ -388,7 +497,27 @@ func handlerCommand(data []byte, conn net.Conn) bool {
 		return true
 	}
 	if (dataMapStr["action"]=="emit") {
+		var channel string
+		var data string
+		fmt.Println("=== emit === \n")
+		if val, ok := dataMapStr["channel"].(string); ok {
+			channel = val
+		}else{
+			return false
+		}
+		fmt.Printf("%T \n", dataMapStr["data"])
+		if val, ok := dataMapStr["data"].(string); ok {
+			data = val
+		}else{
+			sendData(Success{Success:false}, conn)
+			return false
+		}
+		fmt.Printf("channel: %s %s \n", channel, data)
 
+		fmt.Println(dataMapStr["data"].(string))
+
+		sendData(Success{Success:true}, conn)
+		return true
 	}
 	if (dataMapStr["action"]=="set") {
 
@@ -421,7 +550,7 @@ func sendData(data interface{}, conn net.Conn) bool {
 	binary.Write(buffer, binary.LittleEndian, int32(sz))
 	buffer.Write(dataBytes)
 	binary.Write(buffer, binary.LittleEndian, byte(0))
-	binary.Write(buffer, binary.LittleEndian, byte(0))
+	//binary.Write(buffer, binary.LittleEndian, byte(0))
 	conn.Write(buffer.Bytes())
 	fmt.Printf("answer %s \n", buffer.String())
 	return true
