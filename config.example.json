@@ -1,0 +1,13 @@
+{
+  "SecretKey": "asd82nvakadfs",
+  "PortWS": 8080,
+  "HostWS": "0.0.0.0",
+  "PortNET": 8085,
+  "HostNET": "0.0.0.0",
+  "Redis": {
+    "Port": 6379,
+    "Host": "127.0.0.1",
+    "Password": "",
+    "DB": 0
+  }
+}
