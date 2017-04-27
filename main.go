@@ -49,7 +49,7 @@ func main() {
 	// =======================
 	// Connect to redis
 	redisClient = redis.NewClient(&redis.Options{
-		Addr:     conf.Redis.Host,
+		Addr:     conf.Redis.Host+":"+strconv.Itoa(conf.Redis.Port),
 		Password: conf.Redis.Password,
 		DB:       conf.Redis.DB,                 // use default DB
 	})
