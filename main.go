@@ -574,6 +574,7 @@ func handlerCommand(data []byte, conn net.Conn, CSiteId string) (bool, string) {
 
 		has, err := redisClient.Exists("LaWS_Server:name_spaces:" + request.Name).Result()
 		if err != nil {
+			fmt.Println(err)
 			sendData(InvalidAction{Success: false, Reason: "Error store, try latter...", Code: 302}, conn)
 			return false, ""
 		}
