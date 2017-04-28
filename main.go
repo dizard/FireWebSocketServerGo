@@ -53,6 +53,12 @@ func main() {
 		Password: conf.Redis.Password,
 		DB:       conf.Redis.DB,                 // use default DB
 	})
+	pong, err := redisClient.Ping().Result()
+	if err!=nil{
+		fmt.Println("Redis error:", err)
+		os.Exit(1)
+	}
+	fmt.Println("redis pong", pong)
 
 	go runWS_Server()
 	runNET_Server()
@@ -287,7 +293,7 @@ type JQuery struct {
 	Channel string `json:"channel"`
 	SKey    string `json:"sKey"`
 	Key     string `json:"key"`
-	Data    map[string]interface{} `json:"data"`
+	Data    interface{} `json:"data"`
 	Params  map[string]interface{} `json:"params"`
 }
 
@@ -511,7 +517,7 @@ func handleRequest(conn net.Conn) {
 		ok, newSiteId = handlerCommand(readbuf[0: lengthData], conn, CSiteId)
 
 		if !ok {
-			conn.Close();
+			conn.Close()
 			break
 		}
 		if newSiteId != "" {
@@ -522,9 +528,11 @@ func handleRequest(conn net.Conn) {
 
 // Обрабочик команд TCP сервера
 func handlerCommand(data []byte, conn net.Conn, CSiteId string) (bool, string) {
+	fmt.Printf("%s \n", data)
 	var request JQuery
 	err := json.Unmarshal(data, &request)
 	if err != nil {
+		sendData(Success{Success: false}, conn)
 		fmt.Println("Error", err)
 		return false, ""
 	}
@@ -566,7 +574,7 @@ func handlerCommand(data []byte, conn net.Conn, CSiteId string) (bool, string) {
 			sendData(InvalidAction{Success: false, Reason: "Need key", Code: 300}, conn)
 			return false, ""
 		}
-		if request.Key != "asd82nvakadfs" {
+		if request.Key != conf.SecretKey {
 			sendData(InvalidAction{Success: false, Reason: "Invalid key", Code: 306}, conn)
 			return false, ""
 		}
@@ -604,7 +612,7 @@ func handlerCommand(data []byte, conn net.Conn, CSiteId string) (bool, string) {
 			return true, ""
 		}
 		var userId string
-		if v, ok := request.Params["userId"]; ok {
+		if v, ok := request.Params["userId"].(map[string]string); ok {
 			userId = ItoStr(v)
 		}
 
