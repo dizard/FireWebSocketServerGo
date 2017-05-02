@@ -479,6 +479,20 @@ func handlerWS(session sockjs.Session) {
 				//fmt.Println(channelName)
 				WSConn.channels = append(WSConn.channels, channelName)
 
+
+				if channelName[0:1] == "#" {
+					if _, ok := WSSrv.PRIVATE[WSConn.siteId]; !ok {
+						continue
+					}
+					if _, ok := WSSrv.PRIVATE[WSConn.siteId][channelName]; !ok {
+						continue
+					}
+					if _, ok := WSSrv.PRIVATE[WSConn.siteId][channelName][WSConn.userId]; !ok {
+						continue
+					}
+				}
+
+
 				WSSrv.Lock()
 				mm, ok := WSSrv.NS_CHANNEL_USER[WSConn.siteId]
 				if !ok {
@@ -507,13 +521,11 @@ func handlerWS(session sockjs.Session) {
 					if data != "" {
 						WSConn.conn.Send(string(data))
 					}
-				} else if channelName[0:1] != "#" {
-					//fmt.Printf("=========== %s \n", channelName)
+				} else  {
 					data := WSSrv.Store.load(WSConn.siteId, channelName, "")
 					if data == "" {
 						continue
 					}
-
 					dataB := []byte(data)
 					out, err := json.Marshal(aMess{Event: channelName, Data: (*json.RawMessage)(&dataB)})
 					if err == nil {
@@ -702,6 +714,11 @@ func handlerCommand(data []byte, conn net.Conn, CSiteId string) (bool, string) {
 		if v, ok := request.Params["userId"].(map[string]string); ok {
 			userId = ItoStr(v)
 		}
+		if request.Channel[0:1] == "@" && userId=="" {
+			sendData(InvalidAction{Success: false, Reason: "Need userid for user `@` channel"}, conn)
+			return true, ""
+		}
+
 		sendData(Success{Success: true}, conn)
 		out, _ := json.Marshal(aMess{Event:request.Channel, Data:request.Data})
 		WSSrv.emit(CSiteId, request.Channel, string(out), userId)
@@ -720,6 +737,11 @@ func handlerCommand(data []byte, conn net.Conn, CSiteId string) (bool, string) {
 		}
 		if v, ok := request.Params["ttl"]; ok {
 			ttl = ItoInt(v)
+		}
+
+		if request.Channel[0:1] == "@" && userId=="" {
+			sendData(InvalidAction{Success: false, Reason: "Need userid for user `@` channel"}, conn)
+			return true, ""
 		}
 
 		out, err := json.Marshal(request.Data)
