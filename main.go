@@ -14,12 +14,13 @@ import (
 	"net/http"
 	"github.com/dgrijalva/jwt-go"
 	"strconv"
+	"sync"
+	"runtime"
 )
 
 const (
 	CONN_TYPE = "tcp"
 )
-
 var redisClient *redis.Client
 
 
@@ -60,6 +61,15 @@ func main() {
 	}
 	fmt.Println("redis pong", pong)
 
+	numcpu := runtime.NumCPU()
+	fmt.Println("NumCPU", numcpu)
+	runtime.GOMAXPROCS(numcpu)
+
+	defer func() {
+		if err := recover(); err != nil {
+			fmt.Println(err)
+		}
+	}()
 	go runWS_Server()
 	runNET_Server()
 }
@@ -122,12 +132,19 @@ type IWSConn struct {
 }
 type IStore struct{}
 
+
+type ChannelInfo struct {
+	CountUser int `json:"countUser"`
+	CountConnection int `json:"countConnection"`
+	ConnId_UserId map[string]string `json:"connId_UserId"`
+}
+
 func (c *IStore) save(siteId string, channel string, message string, userid string, ttl int) bool {
 	key := "LaWS_Server:store:" + siteId + ":" + channel
 	if userid != "" {
 		key = "LaWS_Server:store:" + siteId + ":" + userid + ":" + channel
 	}
-	fmt.Printf("save: %s - %s\n", key, message)
+	//fmt.Printf("save: %s - %s\n", key, message)
 	redisClient.Set(key, message, 0).Err()
 	return true
 }
@@ -145,6 +162,8 @@ func (c *IStore) load(siteId string, channel string, userid string) string {
 }
 
 type WS_Server struct {
+	sync.RWMutex
+
 	connections map[string]IWSConn
 	// siteId userId sessionid = session
 	NS_USER map[string]map[string]map[string]sockjs.Session
@@ -154,8 +173,15 @@ type WS_Server struct {
 	NS_CHANNEL_USER map[string]map[string]map[string]map[string]sockjs.Session
 	Store           IStore
 }
-
 func (c *WS_Server) emit(siteId string, channel string, message string, userid string) bool {
+	var listToSend []sockjs.Session
+	WSSrv.RLock()
+	defer func() {
+		WSSrv.RUnlock()
+		for i := 0; i < len(listToSend); i++ {
+			listToSend[i].Send(message)
+		}
+	}()
 	if _, ok := WSSrv.NS_CHANNEL_USER[siteId]; !ok {
 		return true
 	}
@@ -168,13 +194,13 @@ func (c *WS_Server) emit(siteId string, channel string, message string, userid s
 			return true
 		}
 		for kS := range WSSrv.NS_USER[siteId][userid] {
-			WSSrv.NS_USER[siteId][userid][kS].Send(message)
+			listToSend = append(listToSend, WSSrv.NS_USER[siteId][userid][kS])
 		}
 		return true
 	}
 	for kU := range WSSrv.NS_CHANNEL_USER[siteId][channel] {
 		for kS := range WSSrv.NS_USER[siteId][kU] {
-			WSSrv.NS_USER[siteId][kU][kS].Send(message)
+			listToSend = append(listToSend, WSSrv.NS_USER[siteId][kU][kS])
 		}
 	}
 	return true
@@ -228,7 +254,43 @@ func (c *WS_Server) unSubscribe(siteId string, channel string, userid string) bo
 	return true
 }
 func (c *WS_Server) channelInfo(siteId string, channel string) []byte {
-	return []byte("")
+	countUser := 0
+	countConnections := 0
+	listConnection := make(map[string]string)
+
+	if _, ok := c.NS_CHANNEL_USER[siteId]; !ok {
+		data, _ := json.Marshal(ChannelInfo{
+			CountUser:countUser,
+			CountConnection:countConnections,
+			ConnId_UserId:listConnection,
+		})
+		return data
+	}
+
+	if _, ok := c.NS_CHANNEL_USER[siteId][channel]; !ok {
+		data, _ := json.Marshal(ChannelInfo{
+			CountUser:countUser,
+			CountConnection:countConnections,
+			ConnId_UserId:listConnection,
+		})
+		return data
+	}
+	for kU := range c.NS_CHANNEL_USER[siteId][channel] {
+		countUser++
+		for _ = range WSSrv.NS_USER[siteId][kU] {
+			//listConnection[kS] = kU
+			countConnections++
+		}
+	}
+	data, err := json.Marshal(ChannelInfo{
+		CountUser:countUser,
+		CountConnection:countConnections,
+		ConnId_UserId:listConnection,
+	})
+	if err!=nil {
+		return []byte("")
+	}
+	return data
 }
 
 var WSSrv *WS_Server
@@ -293,7 +355,7 @@ type JQuery struct {
 	Channel string `json:"channel"`
 	SKey    string `json:"sKey"`
 	Key     string `json:"key"`
-	Data    interface{} `json:"data"`
+	Data    *json.RawMessage `json:"data"`
 	Params  map[string]interface{} `json:"params"`
 }
 
@@ -301,7 +363,9 @@ func handlerWS(session sockjs.Session) {
 	//fmt.Println("new connection to WS server")
 
 	var WSConn = IWSConn{conn: session, siteId: "", userId: ""}
+	WSSrv.Lock()
 	WSSrv.connections[session.ID()] = WSConn
+	WSSrv.Unlock()
 
 	// Слушаем что нам шлет сокет
 	for {
@@ -371,6 +435,7 @@ func handlerWS(session sockjs.Session) {
 						userId := claims["i"].(string)
 						//fmt.Printf("siteId %s userId %s session %s %T\n", siteId, userId, session.ID(), session)
 
+						WSSrv.Lock()
 						mm, ok := WSSrv.NS_USER[siteId]
 						if !ok {
 							mm = make(map[string]map[string]sockjs.Session)
@@ -385,6 +450,8 @@ func handlerWS(session sockjs.Session) {
 
 						WSConn.siteId = siteId
 						WSConn.userId = userId
+						WSSrv.Unlock()
+
 						session.Send(string(dataBytes))
 					} else {
 						session.Close(3404, "Invalid token")
@@ -412,6 +479,7 @@ func handlerWS(session sockjs.Session) {
 				//fmt.Println(channelName)
 				WSConn.channels = append(WSConn.channels, channelName)
 
+				WSSrv.Lock()
 				mm, ok := WSSrv.NS_CHANNEL_USER[WSConn.siteId]
 				if !ok {
 					mm = make(map[string]map[string]map[string]sockjs.Session)
@@ -431,6 +499,8 @@ func handlerWS(session sockjs.Session) {
 				WSSrv.NS_CHANNEL_USER[WSConn.siteId][channelName][WSConn.userId] = mmmm
 
 				WSSrv.NS_CHANNEL_USER[WSConn.siteId][channelName][WSConn.userId][session.ID()] = session
+				WSSrv.Unlock()
+
 
 				if channelName[0:1] == "@" {
 					data := WSSrv.Store.load(WSConn.siteId, channelName, WSConn.userId)
@@ -456,24 +526,41 @@ func handlerWS(session sockjs.Session) {
 		break
 	}
 
-	// ===============================================
-	// =========== connection closed =================
-	for _, channelName := range WSConn.channels {
-		//fmt.Printf("channel %s \n", channelName)
-		delete(WSSrv.NS_CHANNEL_USER[WSConn.siteId][channelName][WSConn.userId], WSConn.siteId)
 
-		// Очищаем пустой map
-		if len(WSSrv.NS_CHANNEL_USER[WSConn.siteId][channelName][WSConn.userId]) == 0 {
-			delete(WSSrv.NS_CHANNEL_USER[WSConn.siteId][channelName], WSConn.userId)
+	defer func() {
+		fmt.Println("connection closed")
+		// ===============================================
+		// =========== connection closed =================
+		WSSrv.Lock()
+		if len(WSConn.channels) > 0 {
+			for _, channelName := range WSConn.channels {
+				delete(WSSrv.NS_CHANNEL_USER[WSConn.siteId][channelName][WSConn.userId], WSConn.conn.ID())
+				// Очищаем пустой map
+				if len(WSSrv.NS_CHANNEL_USER[WSConn.siteId][channelName][WSConn.userId]) == 0 {
+					delete(WSSrv.NS_CHANNEL_USER[WSConn.siteId][channelName], WSConn.userId)
+				}
+				if len(WSSrv.NS_CHANNEL_USER[WSConn.siteId][channelName]) == 0 {
+					delete(WSSrv.NS_CHANNEL_USER[WSConn.siteId], channelName)
+				}
+				if len(WSSrv.NS_CHANNEL_USER[WSConn.siteId]) == 0 {
+					delete(WSSrv.NS_CHANNEL_USER, WSConn.siteId)
+				}
+			}
 		}
-		if len(WSSrv.NS_CHANNEL_USER[WSConn.siteId][channelName]) == 0 {
-			delete(WSSrv.NS_CHANNEL_USER[WSConn.siteId], channelName)
+
+		if WSConn.userId!="" {
+			// siteId userId sessionid = session
+			delete(WSSrv.NS_USER[WSConn.siteId][WSConn.userId],  WSConn.conn.ID())
+			if len(WSSrv.NS_USER[WSConn.siteId][WSConn.userId]) == 0 {
+				delete(WSSrv.NS_USER[WSConn.siteId], WSConn.userId)
+			}
+			if len(WSSrv.NS_USER[WSConn.siteId]) == 0 {
+				delete(WSSrv.NS_USER, WSConn.siteId)
+			}
 		}
-		if len(WSSrv.NS_CHANNEL_USER[WSConn.siteId]) == 0 {
-			delete(WSSrv.NS_CHANNEL_USER, WSConn.siteId)
-		}
-	}
-	delete(WSSrv.connections, WSConn.conn.ID())
+		delete(WSSrv.connections, WSConn.conn.ID())
+		WSSrv.Unlock()
+	}()
 }
 
 //func convertByteToInt(in []byte) int32 {
@@ -482,7 +569,7 @@ func handlerWS(session sockjs.Session) {
 
 // Handles incoming requests.
 func handleRequest(conn net.Conn) {
-	fmt.Println("new connection")
+	//fmt.Println("new connection")
 	var CSiteId string
 	var lengthData int32
 	var err error
@@ -500,19 +587,19 @@ func handleRequest(conn net.Conn) {
 		}
 		b := bytes.NewBuffer(readbuf)
 		binary.Read(b, binary.LittleEndian, &lengthData)
-		fmt.Printf("lengthData: %d \n", lengthData)
+		//fmt.Printf("lengthData: %d \n", lengthData)
 		if lengthData < 1 {
 			conn.Close()
 			return
 		}
 		readbuf = make([]byte, lengthData+1)
-		readed, err := conn.Read(readbuf)
+		_, err := conn.Read(readbuf)
 		if err != nil {
 			//fmt.Println("Error reading:", err.Error())
 			conn.Close()
 			return
 		}
-		fmt.Printf("readed %d \n", readed)
+		//fmt.Printf("readed %d \n", readed)
 
 		ok, newSiteId = handlerCommand(readbuf[0: lengthData], conn, CSiteId)
 
@@ -528,17 +615,17 @@ func handleRequest(conn net.Conn) {
 
 // Обрабочик команд TCP сервера
 func handlerCommand(data []byte, conn net.Conn, CSiteId string) (bool, string) {
-	fmt.Printf("%s \n", data)
+	//fmt.Printf("%s \n", data)
 	var request JQuery
 	err := json.Unmarshal(data, &request)
 	if err != nil {
 		sendData(Success{Success: false}, conn)
-		fmt.Println("Error", err)
+		fmt.Println("Error Unmarshal", err)
 		return false, ""
 	}
 
 	// TODO check auth
-	fmt.Printf("===== %v\n", request)
+	//fmt.Printf("===== %v\n", request)
 	if request.Action == "auth" {
 		if request.SKey == "" {
 			return false, ""
@@ -615,10 +702,9 @@ func handlerCommand(data []byte, conn net.Conn, CSiteId string) (bool, string) {
 		if v, ok := request.Params["userId"].(map[string]string); ok {
 			userId = ItoStr(v)
 		}
-
-		out, _ := json.Marshal(request.Data)
-		WSSrv.emit(CSiteId, request.Channel, string(out), userId)
 		sendData(Success{Success: true}, conn)
+		out, _ := json.Marshal(aMess{Event:request.Channel, Data:request.Data})
+		WSSrv.emit(CSiteId, request.Channel, string(out), userId)
 		return true, ""
 	}
 	if request.Action == "set" {
@@ -637,9 +723,13 @@ func handlerCommand(data []byte, conn net.Conn, CSiteId string) (bool, string) {
 		}
 
 		out, err := json.Marshal(request.Data)
-		fmt.Printf("error %T", err)
-		WSSrv.set(CSiteId, request.Channel, string(out), userId, emit, ttl)
+		if err!=nil {
+			fmt.Printf("error marshal data %T", err)
+			sendData(Success{Success: false}, conn)
+			return true, ""
+		}
 		sendData(Success{Success: true}, conn)
+		WSSrv.set(CSiteId, request.Channel, string(out), userId, emit, ttl)
 		return true, ""
 	}
 	if request.Action == "get" {
@@ -666,9 +756,8 @@ func handlerCommand(data []byte, conn net.Conn, CSiteId string) (bool, string) {
 			sendData(InvalidAction{Success: false, Reason: "Need userid", Code: 300}, conn)
 			return true, ""
 		}
-
-		WSSrv.subscribe(CSiteId, request.Channel, userId)
 		sendData(Success{Success: true}, conn)
+		WSSrv.subscribe(CSiteId, request.Channel, userId)
 		return true, ""
 	}
 	if request.Action == "unsubscribe" {
@@ -683,9 +772,8 @@ func handlerCommand(data []byte, conn net.Conn, CSiteId string) (bool, string) {
 			sendData(InvalidAction{Success: false, Reason: "Need userid", Code: 300}, conn)
 			return true, ""
 		}
-
-		WSSrv.unSubscribe(CSiteId, request.Channel, userId)
 		sendData(Success{Success: true}, conn)
+		WSSrv.unSubscribe(CSiteId, request.Channel, userId)
 		return true, ""
 	}
 	if request.Action == "channelInfo" {
